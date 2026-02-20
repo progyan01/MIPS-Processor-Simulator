@@ -1,6 +1,6 @@
 import sys
 
-#Constants
+# Constants
 TEXT_START = 0x00400000
 DATA_START = 0x10010000
 
@@ -38,7 +38,6 @@ class Memory:
         self.data = {} # Dictionary maps Address -> Byte
 
     def load_word(self, address):
-        # Little-endian load (standard for MARS/MIPS simulators)
         b0 = self.data.get(address, 0)
         b1 = self.data.get(address+1, 0)
         b2 = self.data.get(address+2, 0)
@@ -61,27 +60,27 @@ class Memory:
         return "".join(chars)
 
 class MIPS_Processor:
-    def __init__(self):
+    def __init__(self, debug=True):
         self.pc = TEXT_START
         self.reg_file = RegisterFile()
         self.alu = ALU()
         self.memory = Memory()
         self.running = True
+        self.debug = debug
+        self.console_output = ""  # stores the syscall prints
 
     def load_segments(self, text_file, data_file):
-        # Load Instructions (Text Segment)
         current_addr = TEXT_START
         try:
             with open(text_file, 'r') as f:
                 for line in f:
-                    # Parse Binary Text ("0010...") to int
                     inst = int(line.strip(), 2) 
                     self.memory.store_word(current_addr, inst)
                     current_addr += 4
         except FileNotFoundError:
             print(f"Error: {text_file} not found.")
+            sys.exit(1)
 
-        # Load Data (Data Segment)
         current_addr = DATA_START
         try:
             with open(data_file, 'r') as f:
@@ -94,14 +93,22 @@ class MIPS_Processor:
 
     def run(self):
         print("--- Simulation Start ---")
+        cycle = 1
+        
         while self.running:
+            if self.debug:
+                print(f"\n--- Cycle {cycle} | PC: {hex(self.pc)} ---")
+                
             # 1. IF: Instruction Fetch
             instruction = self.memory.load_word(self.pc)
             next_pc = self.pc + 4
 
-            if instruction == 0: # NOP or end of code
-                print("End of instructions.")
+            if instruction == 0: 
+                print("\n[End of instructions reached]")
                 break
+                
+            if self.debug:
+                print(f"[IF]  Fetched Inst: {hex(instruction)}")
 
             # 2. ID: Instruction Decode
             opcode = (instruction >> 26) & 0x3F
@@ -111,88 +118,139 @@ class MIPS_Processor:
             shamt = (instruction >> 6) & 0x1F
             funct = instruction & 0x3F
             imm = instruction & 0xFFFF
-            
-            # Sign Extend Immediate
             imm_se = imm if (imm < 0x8000) else imm - 0x10000
 
-            # Control Signals (Simplified)
             alu_op = None
             mem_read = False
             mem_write = False
             reg_write = False
             branch = False
             jump = False
+            target_reg = rd 
+
+            if self.debug:
+                print(f"[ID]  Opcode: {opcode}, rs: {rs}, rt: {rt}, rd: {rd}, imm: {imm_se}")
             
             # 3. EX: Execute & Control Logic
-            target_reg = rd # Default for R-type
-            
-            # R-Type Instructions
             if opcode == 0:
                 reg_write = True
                 if funct == 32: alu_op = 'ADD'
+                elif funct == 33: alu_op = 'ADD'
                 elif funct == 34: alu_op = 'SUB'
                 elif funct == 36: alu_op = 'AND'
                 elif funct == 37: alu_op = 'OR'
                 elif funct == 42: alu_op = 'SLT'
                 elif funct == 0:  alu_op = 'SLL'
                 elif funct == 2:  alu_op = 'SRL'
-                elif funct == 12: # SYSCALL
+                elif funct == 12: 
                     self.handle_syscall()
-                    reg_write = False # Syscall doesn't use WB stage
+                    reg_write = False 
             
-            # I-Type Instructions
-            elif opcode == 8:  alu_op = 'ADD'; target_reg = rt; reg_write = True # ADDI
-            elif opcode == 9:  alu_op = 'ADD'; target_reg = rt; reg_write = True # ADDIU
-            elif opcode == 12: alu_op = 'AND'; target_reg = rt; reg_write = True # ANDI
-            elif opcode == 13: alu_op = 'OR';  target_reg = rt; reg_write = True # ORI
-            elif opcode == 15: alu_op = 'LUI'; target_reg = rt; reg_write = True # LUI
-            elif opcode == 35: alu_op = 'ADD'; target_reg = rt; reg_write = True; mem_read = True # LW
-            elif opcode == 43: alu_op = 'ADD'; mem_write = True # SW
-            elif opcode == 4:  branch = True # BEQ
-            elif opcode == 5:  branch = True # BNE
-            
-            # J-Type Instructions
-            elif opcode == 2: jump = True # J
+            elif opcode == 8:  alu_op = 'ADD'; target_reg = rt; reg_write = True 
+            elif opcode == 9:  alu_op = 'ADD'; target_reg = rt; reg_write = True 
+            elif opcode == 12: alu_op = 'AND'; target_reg = rt; reg_write = True 
+            elif opcode == 13: alu_op = 'OR';  target_reg = rt; reg_write = True 
+            elif opcode == 15: alu_op = 'LUI'; target_reg = rt; reg_write = True 
+            elif opcode == 35: alu_op = 'ADD'; target_reg = rt; reg_write = True; mem_read = True 
+            elif opcode == 43: alu_op = 'ADD'; mem_write = True 
+            elif opcode == 4:  branch = True 
+            elif opcode == 5:  branch = True 
+            elif opcode == 2:  jump = True 
 
-            # Execute ALU
             val1 = self.reg_file.read(rs)
             val2 = self.reg_file.read(rt)
-            
-            # Select ALU Operand 2 (Immediate or Register)
             alu_in2 = imm_se if (opcode != 0 and opcode != 4 and opcode != 5) else val2
             
             alu_result = 0
             if alu_op:
                 alu_result = self.alu.execute(alu_op, val1, alu_in2, shamt)
+                if self.debug:
+                    print(f"[EX]  ALU Op: {alu_op}, Result: {alu_result}")
 
-            # Branch/Jump Logic
             if jump:
-                # Jump target: top 4 bits of PC + 26 bits of inst shifted left 2
                 next_pc = (next_pc & 0xF0000000) | ((instruction & 0x03FFFFFF) << 2)
+                if self.debug: print(f"[EX]  Jump taken to {hex(next_pc)}")
             elif branch:
                 taken = False
-                if opcode == 4 and val1 == val2: taken = True    # BEQ
-                if opcode == 5 and val1 != val2: taken = True    # BNE
+                if opcode == 4 and val1 == val2: taken = True    
+                if opcode == 5 and val1 != val2: taken = True    
                 if taken:
                     next_pc = next_pc + (imm_se << 2)
+                    if self.debug: print(f"[EX]  Branch taken to {hex(next_pc)}")
+                elif self.debug:
+                    print(f"[EX]  Branch not taken")
 
             # 4. MEM: Memory Access
             mem_data = 0
             if mem_read:
                 mem_data = self.memory.load_word(alu_result)
+                if self.debug: print(f"[MEM] Read value {mem_data} from addr {hex(alu_result)}")
             elif mem_write:
                 self.memory.store_word(alu_result, val2)
+                if self.debug: print(f"[MEM] Wrote value {val2} to addr {hex(alu_result)}")
+            else:
+                if self.debug: print(f"[MEM] No memory access")
 
             # 5. WB: Write Back
             if reg_write:
-                # If loading from memory, write mem_data, else write ALU result
                 write_val = mem_data if mem_read else alu_result
                 self.reg_file.write(target_reg, write_val)
+                if self.debug: print(f"[WB]  Wrote value {write_val} to R{target_reg}")
+            else:
+                if self.debug: print(f"[WB]  No write back")
 
-            # Advance PC
             self.pc = next_pc
+            cycle += 1
+            
+            if not self.running: # Check if syscall 10 triggered exit
+                break
         
+        print("\n" + "="*40)
+        print("          SIMULATION FINISHED")
+        print("="*40)
+        
+        print("\n[FINAL PROGRAM OUTPUT]")
+        if self.console_output:
+            print(f">>> {self.console_output}")
+        else:
+            print(">>> (No output generated by program)")
+            
         self.reg_file.dump()
 
     def handle_syscall(self):
         v0 = self.reg_file.read(2) # $v0
+        a0 = self.reg_file.read(4) # $a0
+
+        if self.debug: print(f"[SYSCALL] Code {v0} triggered")
+
+        if v0 == 1:   # print_int
+            self.console_output += str(a0)  # Save to buffer
+        elif v0 == 4: # print_string
+            self.console_output += self.memory.load_string(a0) # Save to buffer
+        elif v0 == 10: # exit
+            if self.debug: print("[Syscall 10: Program Exit]")
+            self.running = False
+        elif v0 == 11: # print_char
+            self.console_output += chr(a0)  # Save to buffer
+
+# Main Execution
+if __name__ == "__main__":
+    import os
+    
+    text_file = "text_segment machine code.txt"
+    data_file = "data_segment machine code.txt"
+    
+    if not os.path.exists(text_file):
+        print(f"\n[ERROR] I couldn't find '{text_file}'.")
+        print("Please export your .text segment from MARS as 'Binary Text' and save it here.")
+        sys.exit(1)
+        
+    if not os.path.exists(data_file):
+        print(f"\n[WARNING] I couldn't find '{data_file}'.")
+        print("If your code uses a .data segment, please export it from MARS and save it here.")
+        sys.exit(1)
+    
+    # Initialize processor with debug=True to show the 5 stages
+    cpu = MIPS_Processor(debug=True)
+    cpu.load_segments(text_file, data_file)
+    cpu.run()
